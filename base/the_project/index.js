@@ -1,0 +1,183 @@
+import express from "express";
+import axios from "axios";
+import fs from "fs";
+import path from "path";
+import dotenv from "dotenv";
+
+dotenv.config();
+const app = express();
+
+const PORT = process.env.PORT;
+const APP_DIR = process.cwd();
+const backendUrl = process.env.BACKEND_URL;
+const imageUrl = process.env.IMAGE_URL;
+
+const PV_PATH = process.env.PV_PATH;
+const imagePath = path.join(PV_PATH, "image.jpg");
+
+const tenMinutes = 10 * 60 * 1000;
+
+let isHealthy = true
+
+// placeholder store until todo-backend takes over persistence
+
+const indexTemplate = fs.readFileSync(path.join(APP_DIR, "index.html"), "utf-8");
+const unhealthyTemplate = fs.readFileSync(path.join(APP_DIR, "unhealthy.html"), "utf-8");
+console.log("logs from the project");
+const escapeHtml = (text) =>
+    text.replace(/[&<>"']/g, (char) => ({
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+    }[char]));
+
+const renderIndexHtml = async () => {
+    const response = await axios.get(`${backendUrl}/todos`);
+    const todos = response.data.todos;
+    //console.log(">>>> todos", todos)
+    const items = todos.reverse().map(({ id, data, done }) => `
+        <li class="todo-item${done ? " done" : ""}" data-todo-id="${id}">
+            <span class="todo-text">${escapeHtml(data)}</span>
+            ${done
+            ? '<span class="todo-done-label">DONE</span>'
+            : '<button class="mark-done-button" type="button">Mark done</button>'}
+        </li>`).join("");
+
+    return indexTemplate.replace("<!--TODOS-->", items);
+};
+
+app.use("/images", express.static(PV_PATH));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+const downloadImage = async () => {
+    console.log("Starting image download...");
+
+    const imageResponse = await axios.get(imageUrl, { responseType: "stream" });
+
+    const writer = fs.createWriteStream(imagePath);
+
+    imageResponse.data.pipe(writer);
+
+    await new Promise((resolve, reject) => {
+        writer.on("finish", resolve);
+        writer.on("error", reject);
+    });
+
+    console.log("Image downloaded successfully.");
+};
+
+app.get("/", async (req, res) => {
+    console.log("Received request for /");
+
+    if (!isHealthy) {
+        return res.status(503).send(unhealthyTemplate);
+    }
+
+    const imageExists = fs.existsSync(imagePath);
+
+    if (imageExists) {
+        console.log("Image exists, checking age...");
+
+        const stats = fs.statSync(imagePath);
+
+        const imageAge = Date.now() - stats.mtimeMs;
+
+        console.log(`Image last modified at: ${stats.mtimeMs}`);
+        console.log(`Current time: ${Date.now()}`);
+        console.log(`Image age: ${imageAge} ms`);
+
+        if (imageAge < tenMinutes) {
+            console.log("Image is recent, serving existing image.");
+
+            return res.send(await renderIndexHtml());
+        }
+
+        console.log("Image is old.");
+
+        // Send the page immediately
+        res.send(await renderIndexHtml());
+
+        // Download in the background
+        try {
+            console.log("Downloading new image...");
+            await downloadImage();
+        } catch (error) {
+            console.error("Error fetching image:", error);
+        }
+
+        return;
+    }
+
+    console.log("Image does not exist, downloading...");
+
+    try {
+        await downloadImage();
+
+        console.log("Sending index.html...");
+
+        return res.send(await renderIndexHtml());
+    } catch (error) {
+        console.error("Error fetching image:", error);
+
+        return res.status(500).send("Failed to download image");
+    }
+});
+
+
+app.post("/add-todo-item", async (req, res) => {
+
+    //console.log(`Received todo request: ${JSON.stringify(req.body)}`);
+    const text = req.body?.text?.trim() || "";
+
+    try {
+        await axios.post(`${backendUrl}/todos`, { data: text });
+    } catch (error) {
+        console.error("Error forwarding todo to backend:", error?.message || "Unknown error");
+
+        return res.status(502).send("Failed to save todo");
+    }
+
+    //console.log(`Received todo: ${text}`);
+    return res.redirect(303, "/");
+});
+
+app.put("/todo/:id", async (req, res) => {
+    const id = Number(req.params.id);
+    const { done } = req.body;
+
+    if (!Number.isInteger(id) || id < 1 || typeof done !== "boolean") {
+        return res.status(400).json({ error: "A positive todo id and boolean done status are required" });
+    }
+
+    try {
+        const response = await axios.put(`${backendUrl}/todo/${id}`, { done });
+        return res.status(response.status).json(response.data);
+    } catch (error) {
+        console.error("Error forwarding todo update:", error?.message || "Unknown error");
+        const status = error.response?.status === 404 ? 404 : 502;
+        return res.status(status).json({ error: status === 404 ? "Todo not found" : "Failed to update todo" });
+    }
+});
+
+app.get("/healthz", (req, res) => {
+    if (!isHealthy) {
+        return res.status(500).json({ status: "unhealthy" })
+    }
+
+    return res.status(200).json({ status: "ok" })
+})
+
+app.post("/healthz/toggle", (req, res) => {
+    isHealthy = !isHealthy
+    return res.status(200).json({ status: isHealthy ? "ok" : "unhealthy" })
+})
+
+app.use(express.static(APP_DIR));
+
+app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Image path: ${imagePath}`);
+});
